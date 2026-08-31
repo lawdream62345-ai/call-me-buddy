@@ -78,7 +78,7 @@ def parse_natural_language(user_text: str) -> dict:
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_text},
         ],
-        model="llama3-8b-8192",
+       model="openai/gpt-oss-20b",
         temperature=0.1,
     )
     
