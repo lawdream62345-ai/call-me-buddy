@@ -78,7 +78,7 @@ def parse_natural_language(user_text: str) -> dict:
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_text},
         ],
-        model="llama-3.1-8b-instant",
+        model="llama3-8b-8192",
         temperature=0.1,
     )
     
