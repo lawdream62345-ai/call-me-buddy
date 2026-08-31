@@ -124,17 +124,16 @@ async def process_telegram_message(chat_id: int, text: str):
         await send_telegram_reply(chat_id, f"❌ Error queueing job: {str(e)}")
 
 # ── ROUTES ────────────────────────────────────────────────────────────────────
-@app.get("/twiml")
+@app.api_route("/twiml", methods=["GET", "POST"])
 def generate_twiml(msg: str = "your task"):
-    """Serves high-definition Neural TwiML voice instructions to Twilio."""
+    """Serves high-definition TwiML voice instructions to Twilio for any request method."""
     twiml_script = (
         f"<?xml version='1.0' encoding='UTF-8'?>"
         f"<Response>"
         f"<Pause length='1'/>"
-        # We switched to the ultra-clear Neural engine (Joanna) or a crisp US/UK accent
         f"<Say voice='Polly.Joanna-Neural' language='en-US'>"
         f"Hello! This is your AI reminder. It is time to: {msg}. "
-        f"Have a great session. Goodbye!"
+        f"Have a great day. Goodbye!"
         f"</Say>"
         f"</Response>"
     )
