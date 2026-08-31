@@ -1,10 +1,11 @@
 import os
 import json
 import logging
+import urllib.parse
 from datetime import datetime
 from zoneinfo import ZoneInfo
 import httpx
-from fastapi import FastAPI, Request, BackgroundTasks
+from fastapi import FastAPI, Request, BackgroundTasks, Response
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.jobstores.memory import MemoryJobStore
 from twilio.rest import Client
@@ -37,23 +38,18 @@ def start_scheduler():
 
 # ── CORE FUNCTIONS ────────────────────────────────────────────────────────────
 def trigger_phone_call(task_message: str):
-    """Executes the outbound Twilio call with natural speech synthesis."""
+    """Executes outbound call via public URL to support trial accounts."""
     if not (TWILIO_SID and TWILIO_TOKEN and TWILIO_PHONE and MY_PHONE):
         logger.error("[Twilio] Credentials missing.")
         return
 
     try:
         client = Client(TWILIO_SID, TWILIO_TOKEN)
-        twiml_script = (
-            f"<Response>"
-            f"<Pause length='1'/>"
-            f"<Say voice='Polly.Aditi' language='en-IN'>"
-            f"Hello! This is your AI reminder. It is time to: {task_message}. "
-            f"Stay focused and have a great session. Goodbye!"
-            f"</Say>"
-            f"</Response>"
-        )
-        call = client.calls.create(twiml=twiml_script, to=MY_PHONE, from_=TWILIO_PHONE)
+        safe_msg = urllib.parse.quote(task_message)
+        render_url = "https://call-me-buddy.onrender.com"
+        webhook_url = f"{render_url}/twiml?msg={safe_msg}"
+
+        call = client.calls.create(url=webhook_url, to=MY_PHONE, from_=TWILIO_PHONE)
         logger.info(f"[Twilio] Call placed! SID: {call.sid}")
     except Exception as e:
         logger.error(f"[Twilio] Call dispatch failed: {e}")
@@ -78,7 +74,7 @@ def parse_natural_language(user_text: str) -> dict:
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_text},
         ],
-       model="openai/gpt-oss-20b",
+        model="openai/gpt-oss-20b",
         temperature=0.1,
     )
     
@@ -132,6 +128,21 @@ async def process_telegram_message(chat_id: int, text: str):
 def health_check():
     """Ping target for UptimeRobot to prevent Render sleeping."""
     return {"status": "alive", "server_time_ist": datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S")}
+
+@app.get("/twiml")
+def generate_twiml(msg: str = "your task"):
+    """Serves dynamic TwiML XML voice instructions to Twilio."""
+    twiml_script = (
+        f"<?xml version='1.0' encoding='UTF-8'?>"
+        f"<Response>"
+        f"<Pause length='1'/>"
+        f"<Say voice='Polly.Aditi' language='en-IN'>"
+        f"Hello! This is your AI reminder. It is time to: {msg}. "
+        f"Stay focused and have a great session. Goodbye!"
+        f"</Say>"
+        f"</Response>"
+    )
+    return Response(content=twiml_script, media_type="application/xml")
 
 @app.post("/webhook")
 async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
