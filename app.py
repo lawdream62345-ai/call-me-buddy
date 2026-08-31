@@ -124,21 +124,17 @@ async def process_telegram_message(chat_id: int, text: str):
         await send_telegram_reply(chat_id, f"❌ Error queueing job: {str(e)}")
 
 # ── ROUTES ────────────────────────────────────────────────────────────────────
-@app.get("/")
-def health_check():
-    """Ping target for UptimeRobot to prevent Render sleeping."""
-    return {"status": "alive", "server_time_ist": datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S")}
-
 @app.get("/twiml")
 def generate_twiml(msg: str = "your task"):
-    """Serves dynamic TwiML XML voice instructions to Twilio."""
+    """Serves high-definition Neural TwiML voice instructions to Twilio."""
     twiml_script = (
         f"<?xml version='1.0' encoding='UTF-8'?>"
         f"<Response>"
         f"<Pause length='1'/>"
-        f"<Say voice='Polly.Aditi' language='en-IN'>"
+        # We switched to the ultra-clear Neural engine (Joanna) or a crisp US/UK accent
+        f"<Say voice='Polly.Joanna-Neural' language='en-US'>"
         f"Hello! This is your AI reminder. It is time to: {msg}. "
-        f"Stay focused and have a great session. Goodbye!"
+        f"Have a great session. Goodbye!"
         f"</Say>"
         f"</Response>"
     )
