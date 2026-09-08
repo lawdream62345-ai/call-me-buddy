@@ -5,11 +5,10 @@ import urllib.parse
 from datetime import datetime
 from zoneinfo import ZoneInfo
 import httpx
-from fastapi import FastAPI, Request, BackgroundTasks, Response
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from apscheduler.jobstores.memory import MemoryJobStore
+from fastapi import FastAPI, Request, BackgroundTasks, Response, HTTPException
 from twilio.rest import Client
 from groq import Groq
+from qstash import QStash
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 logger = logging.getLogger("ai-caller")
@@ -22,19 +21,18 @@ TWILIO_TOKEN   = os.environ.get("TWILIO_AUTH_TOKEN", "")
 TWILIO_PHONE   = os.environ.get("TWILIO_PHONE_NUMBER", "")
 MY_PHONE       = os.environ.get("MY_PHONE_NUMBER", "")
 
+# QSTASH & SECURITY VARIABLES
+QSTASH_TOKEN   = os.environ.get("QSTASH_TOKEN", "")
+APP_SECRET     = os.environ.get("APP_SECRET", "super_secret_key_123")
+RENDER_URL     = os.environ.get("RENDER_URL", "https://call-me-buddy.onrender.com")
+
 TELEGRAM_API_URL = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
 IST = ZoneInfo("Asia/Kolkata")
 
-# ── SCHEDULER & FASTAPI ───────────────────────────────────────────────────────
+# ── INITIALIZATION ────────────────────────────────────────────────────────────
 app = FastAPI(title="24/7 AI Task Caller")
-scheduler = AsyncIOScheduler(timezone=IST, jobstores={"default": MemoryJobStore()})
 groq_client = Groq(api_key=GROQ_API_KEY)
-
-@app.on_event("startup")
-def start_scheduler():
-    if not scheduler.running:
-        scheduler.start()
-        logger.info("[Scheduler] Active in IST timezone.")
+qstash_client = QStash(token=QSTASH_TOKEN)
 
 # ── CORE FUNCTIONS ────────────────────────────────────────────────────────────
 def trigger_phone_call(task_message: str):
@@ -46,8 +44,7 @@ def trigger_phone_call(task_message: str):
     try:
         client = Client(TWILIO_SID, TWILIO_TOKEN)
         safe_msg = urllib.parse.quote(task_message)
-        render_url = "https://call-me-buddy.onrender.com"
-        webhook_url = f"{render_url}/twiml?msg={safe_msg}"
+        webhook_url = f"{RENDER_URL}/twiml?msg={safe_msg}"
 
         call = client.calls.create(url=webhook_url, to=MY_PHONE, from_=TWILIO_PHONE)
         logger.info(f"[Twilio] Call placed! SID: {call.sid}")
@@ -74,7 +71,7 @@ def parse_natural_language(user_text: str) -> dict:
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_text},
         ],
-        model="openai/gpt-oss-20b",
+        model="llama-3.1-8b-instant",  # Groq's official lightning-fast model
         temperature=0.1,
     )
     
@@ -98,35 +95,40 @@ async def process_telegram_message(chat_id: int, text: str):
     try:
         target_naive = datetime.strptime(parsed["run_at"], "%Y-%m-%d %H:%M:%S")
         target_time = target_naive.replace(tzinfo=IST)
+        now_time = datetime.now(IST)
         
-        if target_time <= datetime.now(IST):
+        if target_time <= now_time:
             await send_telegram_reply(chat_id, "❌ That time is in the past. Please give a future time.")
             return
 
-        job_id = f"job_{int(target_time.timestamp())}"
-        scheduler.add_job(
-            trigger_phone_call, 
-            "date", 
-            run_date=target_time, 
-            args=[parsed["task"]], 
-            id=job_id,
-            replace_existing=True
+        # 1. Calculate how many seconds in the future the call should happen
+        delay_seconds = int((target_time - now_time).total_seconds())
+
+        # 2. Tell QStash to hit our webhook in exactly that many seconds
+        qstash_client.message.publish_json(
+            url=f"{RENDER_URL}/execute-call",
+            body={
+                "task": parsed["task"],
+                "secret": APP_SECRET  # Pass our secret back to ourselves for security
+            },
+            delay=f"{delay_seconds}s"
         )
         
         confirmation = (
-            f"✅ **Call Scheduled!**\n\n"
+            f"✅ **Call Scheduled via QStash!**\n\n"
             f"📞 **Time (IST):** `{parsed['run_at']}`\n"
             f"📝 **Task:** {parsed['task']}"
         )
         await send_telegram_reply(chat_id, confirmation)
         
     except Exception as e:
+        logger.error(f"Error queueing job: {str(e)}")
         await send_telegram_reply(chat_id, f"❌ Error queueing job: {str(e)}")
 
 # ── ROUTES ────────────────────────────────────────────────────────────────────
 @app.api_route("/twiml", methods=["GET", "POST"])
 def generate_twiml(msg: str = "your task"):
-    """Serves high-definition TwiML voice instructions to Twilio for any request method."""
+    """Serves high-definition TwiML voice instructions to Twilio."""
     twiml_script = (
         f"<?xml version='1.0' encoding='UTF-8'?>"
         f"<Response>"
@@ -138,6 +140,21 @@ def generate_twiml(msg: str = "your task"):
         f"</Response>"
     )
     return Response(content=twiml_script, media_type="application/xml")
+
+@app.post("/execute-call")
+async def execute_scheduled_call(request: Request):
+    """Webhook triggered by QStash when the timer finishes."""
+    data = await request.json()
+    
+    # Check if the secret matches so random bots can't trigger your calls
+    if data.get("secret") != APP_SECRET:
+        raise HTTPException(status_code=401, detail="Unauthorized call trigger")
+
+    task = data.get("task", "No task provided")
+    
+    # Trigger the call!
+    trigger_phone_call(task)
+    return {"status": "Call Dispatched!"}
 
 @app.post("/webhook")
 async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
