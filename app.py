@@ -14,17 +14,19 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(
 logger = logging.getLogger("ai-caller")
 
 # ── ENVIRONMENT VARIABLES ─────────────────────────────────────────────────────
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
-GROQ_API_KEY   = os.environ.get("GROQ_API_KEY", "")
-TWILIO_SID     = os.environ.get("TWILIO_ACCOUNT_SID", "")
-TWILIO_TOKEN   = os.environ.get("TWILIO_AUTH_TOKEN", "")
-TWILIO_PHONE   = os.environ.get("TWILIO_PHONE_NUMBER", "")
-MY_PHONE       = os.environ.get("MY_PHONE_NUMBER", "")
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "").strip()
+GROQ_API_KEY   = os.environ.get("GROQ_API_KEY", "").strip()
+TWILIO_SID     = os.environ.get("TWILIO_ACCOUNT_SID", "").strip()
+TWILIO_TOKEN   = os.environ.get("TWILIO_AUTH_TOKEN", "").strip()
+TWILIO_PHONE   = os.environ.get("TWILIO_PHONE_NUMBER", "").strip()
+MY_PHONE       = os.environ.get("MY_PHONE_NUMBER", "").strip()
 
-# QSTASH & SECURITY VARIABLES
-QSTASH_TOKEN   = os.environ.get("QSTASH_TOKEN", "")
-APP_SECRET     = os.environ.get("APP_SECRET", "super_secret_key_123")
-RENDER_URL     = os.environ.get("RENDER_URL", "https://call-me-buddy.onrender.com")
+# QSTASH & SECURITY VARIABLES (Picks up whatever you set in Render environment variables)
+QSTASH_TOKEN   = os.environ.get("QSTASH_TOKEN", "").strip()
+APP_SECRET     = os.environ.get("APP_SECRET", "super_secret_key_123").strip()
+
+raw_render_url = os.environ.get("RENDER_URL", "https://call-me-buddy.onrender.com").strip()
+RENDER_URL     = raw_render_url if raw_render_url.startswith("http") else f"https://{raw_render_url}"
 
 TELEGRAM_API_URL = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
 IST = ZoneInfo("Asia/Kolkata")
@@ -71,7 +73,7 @@ def parse_natural_language(user_text: str) -> dict:
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_text},
         ],
-        model="openai/gpt-oss-20b",  # Switched to a universally supported model on Groq
+        model="openai/gpt-oss-20b",
         temperature=0.1,
     )
     
@@ -101,15 +103,13 @@ async def process_telegram_message(chat_id: int, text: str):
             await send_telegram_reply(chat_id, "❌ That time is in the past. Please give a future time.")
             return
 
-        # 1. Calculate how many seconds in the future the call should happen
         delay_seconds = int((target_time - now_time).total_seconds())
 
-        # 2. Tell QStash to hit our webhook in exactly that many seconds
         qstash_client.message.publish_json(
             url=f"{RENDER_URL}/execute-call",
             body={
                 "task": parsed["task"],
-                "secret": APP_SECRET  # Pass our secret back to ourselves for security
+                "secret": APP_SECRET  # Sends your updated Render environment secret back to `/execute-call`
             },
             delay=f"{delay_seconds}s"
         )
@@ -146,13 +146,11 @@ async def execute_scheduled_call(request: Request):
     """Webhook triggered by QStash when the timer finishes."""
     data = await request.json()
     
-    # Check if the secret matches so random bots can't trigger your calls
+    # Validates against the updated APP_SECRET in your Render environment variables
     if data.get("secret") != APP_SECRET:
         raise HTTPException(status_code=401, detail="Unauthorized call trigger")
 
     task = data.get("task", "No task provided")
-    
-    # Trigger the call!
     trigger_phone_call(task)
     return {"status": "Call Dispatched!"}
 
