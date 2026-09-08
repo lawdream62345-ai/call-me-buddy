@@ -71,7 +71,7 @@ def parse_natural_language(user_text: str) -> dict:
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_text},
         ],
-        model="llama-3.1-8b-instant",  # Groq's official lightning-fast model
+        model="openai/gpt-oss-20b",  # Switched to a universally supported model on Groq
         temperature=0.1,
     )
     
