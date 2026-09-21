@@ -1,39 +1,142 @@
 import os
+import json
+import logging
 import urllib.parse
-import requests
-from datetime import datetime, timedelta
-import pytz
-from fastapi import FastAPI, Request, HTTPException, Response
+from datetime import datetime
+from zoneinfo import ZoneInfo
+import httpx
+from fastapi import FastAPI, Request, BackgroundTasks, Response, HTTPException
+from twilio.rest import Client
+from groq import Groq
+from qstash import QStash
 
-app = FastAPI(title="Satyam's PW Academic Assistant")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+logger = logging.getLogger("ai-caller")
 
-# Core Variables
-QSTASH_TOKEN = os.environ.get("QSTASH_TOKEN", "").strip()
-PW_TOKEN = os.environ.get("PW_BEARER_TOKEN", "").strip()
-PRIMARY_BATCH_ID = os.environ.get("PRIMARY_BATCH_ID", "").strip()
+# ── ENVIRONMENT VARIABLES ─────────────────────────────────────────────────────
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "").strip()
+GROQ_API_KEY   = os.environ.get("GROQ_API_KEY", "").strip()
+TWILIO_SID     = os.environ.get("TWILIO_ACCOUNT_SID", "").strip()
+TWILIO_TOKEN   = os.environ.get("TWILIO_AUTH_TOKEN", "").strip()
+TWILIO_PHONE   = os.environ.get("TWILIO_PHONE_NUMBER", "").strip()
+MY_PHONE       = os.environ.get("MY_PHONE_NUMBER", "").strip()
 
-# Twilio & Security Variables
-TWILIO_SID = os.environ.get("TWILIO_ACCOUNT_SID", "").strip()
-TWILIO_TOKEN = os.environ.get("TWILIO_AUTH_TOKEN", "").strip()
-TWILIO_PHONE = os.environ.get("TWILIO_PHONE_NUMBER", "").strip()
-MY_PHONE = os.environ.get("MY_PHONE_NUMBER", "").strip()
-APP_SECRET = os.environ.get("APP_SECRET", "super_secret_satyam").strip()
+# QSTASH & SECURITY VARIABLES (Picks up whatever you set in Render environment variables)
+QSTASH_TOKEN   = os.environ.get("QSTASH_TOKEN", "").strip()
+APP_SECRET     = os.environ.get("APP_SECRET", "super_secret_key_123").strip()
 
-raw_render_url = os.environ.get("RENDER_URL", "").strip()
-RENDER_URL = raw_render_url if raw_render_url.startswith("http") else f"https://{raw_render_url}"
+raw_render_url = os.environ.get("RENDER_URL", "https://call-me-buddy.onrender.com").strip()
+RENDER_URL     = raw_render_url if raw_render_url.startswith("http") else f"https://{raw_render_url}"
 
-@app.get("/health")
-def health_check():
-    return {"status": "awake", "name": "Satyam's PW Bot"}
+TELEGRAM_API_URL = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+IST = ZoneInfo("Asia/Kolkata")
 
+# ── INITIALIZATION ────────────────────────────────────────────────────────────
+app = FastAPI(title="24/7 AI Task Caller")
+groq_client = Groq(api_key=GROQ_API_KEY)
+qstash_client = QStash(token=QSTASH_TOKEN)
+
+# ── CORE FUNCTIONS ────────────────────────────────────────────────────────────
+def trigger_phone_call(task_message: str):
+    """Executes outbound call via public URL to support trial accounts."""
+    if not (TWILIO_SID and TWILIO_TOKEN and TWILIO_PHONE and MY_PHONE):
+        logger.error("[Twilio] Credentials missing.")
+        return
+
+    try:
+        client = Client(TWILIO_SID, TWILIO_TOKEN)
+        safe_msg = urllib.parse.quote(task_message)
+        webhook_url = f"{RENDER_URL}/twiml?msg={safe_msg}"
+
+        call = client.calls.create(url=webhook_url, to=MY_PHONE, from_=TWILIO_PHONE)
+        logger.info(f"[Twilio] Call placed! SID: {call.sid}")
+    except Exception as e:
+        logger.error(f"[Twilio] Call dispatch failed: {e}")
+
+async def send_telegram_reply(chat_id: int, text: str):
+    """Sends a confirmation reply back to your Telegram chat."""
+    async with httpx.AsyncClient() as client:
+        await client.post(TELEGRAM_API_URL, json={"chat_id": chat_id, "text": text})
+
+def parse_natural_language(user_text: str) -> dict:
+    """Extracts task and scheduled IST timestamp using Groq."""
+    now_ist = datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S")
+    system_prompt = (
+        f"Current Indian Standard Time (IST): {now_ist}. "
+        "Extract the task and the future datetime for the requested reminder. "
+        "Return strictly a raw JSON object with keys 'task' (string) and 'run_at' (YYYY-MM-DD HH:MM:SS in 24-hr format). "
+        "Do not include markdown fences, backticks, or any additional text."
+    )
+    
+    response = groq_client.chat.completions.create(
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_text},
+        ],
+        model="openai/gpt-oss-20b",
+        temperature=0.1,
+    )
+    
+    raw = response.choices[0].message.content.strip()
+    clean_json = raw.replace("```json", "").replace("```", "").strip()
+    try:
+        return json.loads(clean_json)
+    except Exception:
+        return {}
+
+async def process_telegram_message(chat_id: int, text: str):
+    parsed = parse_natural_language(text)
+    
+    if "run_at" not in parsed or "task" not in parsed:
+        await send_telegram_reply(
+            chat_id, 
+            "❌ Could not understand the time or task.\n\n*Examples:*\n• *Remind me in 15 minutes to review contracts*\n• *Call me tomorrow at 7:30 AM to prepare notes*"
+        )
+        return
+
+    try:
+        target_naive = datetime.strptime(parsed["run_at"], "%Y-%m-%d %H:%M:%S")
+        target_time = target_naive.replace(tzinfo=IST)
+        now_time = datetime.now(IST)
+        
+        if target_time <= now_time:
+            await send_telegram_reply(chat_id, "❌ That time is in the past. Please give a future time.")
+            return
+
+        delay_seconds = int((target_time - now_time).total_seconds())
+
+        qstash_client.message.publish_json(
+            url=f"{RENDER_URL}/execute-call",
+            body={
+                "task": parsed["task"],
+                "secret": APP_SECRET  # Sends your updated Render environment secret back to `/execute-call`
+            },
+            delay=f"{delay_seconds}s"
+        )
+        
+        confirmation = (
+            f"✅ **Call Scheduled via QStash!**\n\n"
+            f"📞 **Time (IST):** `{parsed['run_at']}`\n"
+            f"📝 **Task:** {parsed['task']}"
+        )
+        await send_telegram_reply(chat_id, confirmation)
+        
+    except Exception as e:
+        logger.error(f"Error queueing job: {str(e)}")
+        await send_telegram_reply(chat_id, f"❌ Error queueing job: {str(e)}")
+
+# ── ROUTES ────────────────────────────────────────────────────────────────────
 @app.api_route("/twiml", methods=["GET", "POST"])
-def generate_twiml(msg: str = "It is time for your class"):
+def generate_twiml(msg: str = "your task"):
     """Serves high-definition TwiML voice instructions to Twilio."""
     twiml_script = (
         f"<?xml version='1.0' encoding='UTF-8'?>"
         f"<Response>"
-        f"<Pause length='2'/>"
-        f"<Say voice='Polly.Aditi' language='en-IN'>{msg}</Say>"
+        f"<Pause length='1'/>"
+        f"<Say voice='Polly.Joanna-Neural' language='en-US'>"
+        f"Hello! This is your AI reminder. It is time to: {msg}. "
+        f"Have a great day. Goodbye!"
+        f"</Say>"
         f"</Response>"
     )
     return Response(content=twiml_script, media_type="application/xml")
@@ -43,75 +146,25 @@ async def execute_scheduled_call(request: Request):
     """Webhook triggered by QStash when the timer finishes."""
     data = await request.json()
     
-    # Secures your endpoint so random bots can't trigger your phone
+    # Validates against the updated APP_SECRET in your Render environment variables
     if data.get("secret") != APP_SECRET:
         raise HTTPException(status_code=401, detail="Unauthorized call trigger")
 
-    task_message = data.get("task", "No task provided")
-    
-    # Prepares the secure webhook URL Twilio will read from
-    safe_msg = urllib.parse.quote(task_message)
-    webhook_url = f"{RENDER_URL}/twiml?msg={safe_msg}"
-    
-    # Triggers the Twilio Call using REST API
-    call_url = f"https://api.twilio.com/2010-04-01/Accounts/{TWILIO_SID}/Calls.json"
-    twilio_data = {
-        "To": MY_PHONE,
-        "From": TWILIO_PHONE,
-        "Url": webhook_url,
-        "Method": "GET"
-    }
-    
-    response = requests.post(call_url, data=twilio_data, auth=(TWILIO_SID, TWILIO_TOKEN))
-    
-    if response.status_code in [200, 201]:
-        return {"status": "Call Dispatched!", "task": task_message}
-    else:
-        return {"error": "Twilio Call failed", "details": response.text}
+    task = data.get("task", "No task provided")
+    trigger_phone_call(task)
+    return {"status": "Call Dispatched!"}
 
-@app.post("/morning-routine")
-def automate_daily_schedule():
-    ist = pytz.timezone('Asia/Kolkata')
-    now_ist = datetime.now(ist)
-    
-    headers = {"Authorization": PW_TOKEN, "Content-Type": "application/json"}
-    
-    try:
-        response = requests.get("https://api.penpencil.co/v1/batches/my-schedule", headers=headers)
-        pw_data = response.json()
-    except Exception:
-        return {"error": "Failed to fetch PW schedule."}
-    
-    for lecture in pw_data.get("data", []):
-        if lecture.get("batchId") != PRIMARY_BATCH_ID:
-            continue
+@app.post("/webhook")
+async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
+    """Receives inbound Telegram webhook payloads."""
+    data = await request.json()
+    if "message" in data and "text" in data["message"]:
+        chat_id = data["message"]["chat"]["id"]
+        text = data["message"]["text"]
+        background_tasks.add_task(process_telegram_message, chat_id, text)
+    return {"status": "ok"}
 
-        start_time_iso = lecture.get("startTime")
-        if not start_time_iso:
-            continue
-
-        class_time = datetime.fromisoformat(start_time_iso.replace('Z', '+00:00')).astimezone(ist)
-        alarm_time = class_time - timedelta(minutes=5)
-        
-        if alarm_time > now_ist:
-            voice_msg = f"Hello Satyam. Your {lecture.get('topicName')} lecture starts in exactly 5 minutes."
-            
-            q_headers = {
-                "Authorization": f"Bearer {QSTASH_TOKEN}", 
-                "Upstash-Not-Before": str(int(alarm_time.timestamp())), 
-                "Content-Type": "application/json"
-            }
-            
-            # Packages the message AND the secret key for QStash to hold onto
-            payload = {
-                "task": voice_msg,
-                "secret": APP_SECRET
-            }
-            
-            requests.post(
-                f"https://qstash.upstash.io/v2/publish/{RENDER_URL}/execute-call", 
-                headers=q_headers, 
-                json=payload
-            )
-
-    return {"status": "Automated successfully"}
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
